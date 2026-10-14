@@ -15,12 +15,10 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
-
       - name: Accept licenses and install SDK platform
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;36.0.0" || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" || true
 
       - name: Build debug APK
         run: |
