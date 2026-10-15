@@ -1,7 +1,13 @@
 package com.puretube.app
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import org.schabi.newpipe.extractor.Image
 import org.schabi.newpipe.extractor.InfoItem
 import org.schabi.newpipe.extractor.MediaFormat
 import org.schabi.newpipe.extractor.NewPipe
@@ -28,6 +34,8 @@ class SearchSession(val handler: SearchQueryHandler, var page: Page?)
 class YtRepository(downloader: OkHttpDownloader) {
 
     private val yt = ServiceList.YouTube
+
+    private val FALLBACK_QUERIES = listOf("trending today", "popular videos", "new this week")
 
     init {
         NewPipe.init(downloader)
@@ -58,13 +66,13 @@ class YtRepository(downloader: OkHttpDownloader) {
             title = info.name,
             channel = info.uploaderName.orEmpty(),
             channelUrl = info.uploaderUrl,
-            thumbnail = info.thumbnails.firstOrNull()?.url,
+            thumbnail = bestImage(info.thumbnails),
             durationSec = info.duration,
             views = info.viewCount,
             uploaded = info.textualUploadDate,
         )
         val channel = info.uploaderUrl?.takeIf { it.isNotBlank() }?.let {
-            ChannelRef(it, info.uploaderName.orEmpty(), info.uploaderAvatars.firstOrNull()?.url)
+            ChannelRef(it, info.uploaderName.orEmpty(), bestImage(info.uploaderAvatars))
         }
 
         WatchData(
@@ -124,12 +132,75 @@ class YtRepository(downloader: OkHttpDownloader) {
         val tab = info.tabs.firstOrNull { it.contentFilters.contains(ChannelTabs.VIDEOS) }
         val items = tab?.let { ChannelTabInfo.getInfo(yt, it).relatedItems }.orEmpty()
         ChannelPage(
-            channel = ChannelRef(ref.url, info.name ?: ref.name, info.avatars.firstOrNull()?.url ?: ref.avatar),
+            channel = ChannelRef(ref.url, info.name ?: ref.name, bestImage(info.avatars) ?: ref.avatar),
             videos = items.toVideos(),
         )
     }
 
+    // ---------- suggestions ----------
+
+    suspend fun suggestions(query: String): List<String> = io {
+        yt.suggestionExtractor.suggestionList(query)
+    }
+
+    // ---------- recommendations ----------
+
+    /**
+     * Local "recommendations" (no account, no tracking): related videos of what you
+     * watched recently plus the newest uploads of channels you subscribe to,
+     * interleaved. Falls back to a few generic searches on a fresh install.
+     */
+    suspend fun recommendations(history: List<VideoItem>, subs: List<ChannelRef>): List<VideoItem> =
+        coroutineScope {
+            val watched = history.map { it.url }.toHashSet()
+            val sources: List<Deferred<List<VideoItem>>> =
+                history.take(3).map { h -> async { safe { relatedOf(h.url) } } } +
+                    subs.shuffled().take(5).map { c -> async { safe { channel(c).videos.take(6) } } }
+
+            var lists = sources.awaitAll()
+            if (lists.all { it.isEmpty() }) {
+                lists = FALLBACK_QUERIES.map { q -> async { safe { search(q).second.take(8) } } }.awaitAll()
+            }
+            interleave(lists).filterNot { it.url in watched }
+        }
+
+    private suspend fun relatedOf(url: String): List<VideoItem> = io {
+        StreamInfo.getInfo(yt, url).relatedItems.toVideos().take(10)
+    }
+
+    /** Round-robin across sources so one channel/video doesn't dominate the feed. */
+    private fun interleave(lists: List<List<VideoItem>>): List<VideoItem> {
+        val seen = HashSet<String>()
+        val out = ArrayList<VideoItem>()
+        val longest = lists.maxOfOrNull { it.size } ?: 0
+        for (i in 0 until longest) {
+            for (list in lists) {
+                list.getOrNull(i)?.let { if (seen.add(it.url)) out.add(it) }
+            }
+        }
+        return out
+    }
+
+    private suspend fun <T> safe(block: suspend () -> List<T>): List<T> =
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+
     // ---------- helpers ----------
+
+    /**
+     * The extractor lists thumbnails/avatars smallest-first, so taking the first one
+     * gives a tiny, blurry image. Pick the largest; when sizes are unknown (-1),
+     * the later entry wins.
+     */
+    private fun bestImage(images: List<Image>): String? =
+        images.withIndex()
+            .maxWithOrNull(compareBy({ it.value.height }, { it.value.width }, { it.index }))
+            ?.value?.url
 
     /** Maps results to [VideoItem] and drops Shorts (and any non-video items). */
     private fun List<InfoItem>.toVideos(): List<VideoItem> =
@@ -141,7 +212,7 @@ class YtRepository(downloader: OkHttpDownloader) {
                     title = it.name,
                     channel = it.uploaderName.orEmpty(),
                     channelUrl = it.uploaderUrl,
-                    thumbnail = it.thumbnails.firstOrNull()?.url,
+                    thumbnail = bestImage(it.thumbnails),
                     durationSec = it.duration,
                     views = it.viewCount,
                     uploaded = it.textualUploadDate,

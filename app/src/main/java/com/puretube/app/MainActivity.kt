@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,11 +30,13 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -41,6 +44,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -60,13 +64,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import java.util.Locale
@@ -82,11 +92,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Tab(val label: String) { Home("Home"), Library("Library") }
+private enum class Tab { Home, Search, Library }
 
 @Composable
 fun AppRoot(vm: AppViewModel = viewModel()) {
     var tab by remember { mutableStateOf(Tab.Home) }
+    // One-shot request: set by a second tap on the Search tab, consumed by the Search screen.
+    var focusSearch by remember { mutableStateOf(false) }
 
     BackHandler(enabled = vm.watchVideo != null) { vm.closeVideo() }
     BackHandler(enabled = vm.watchVideo == null && vm.channelRef != null) { vm.closeChannel() }
@@ -99,13 +111,22 @@ fun AppRoot(vm: AppViewModel = viewModel()) {
                         selected = tab == Tab.Home,
                         onClick = { tab = Tab.Home },
                         icon = { Icon(Icons.Default.Home, null) },
-                        label = { Text(Tab.Home.label) },
+                        label = { Text("Home") },
+                    )
+                    NavigationBarItem(
+                        selected = tab == Tab.Search,
+                        onClick = {
+                            // 1st tap: open the search page. Tap again: focus the box and open the keyboard.
+                            if (tab == Tab.Search) focusSearch = true else tab = Tab.Search
+                        },
+                        icon = { Icon(Icons.Default.Search, null) },
+                        label = { Text("Search") },
                     )
                     NavigationBarItem(
                         selected = tab == Tab.Library,
                         onClick = { tab = Tab.Library },
                         icon = { Icon(Icons.Default.VideoLibrary, null) },
-                        label = { Text(Tab.Library.label) },
+                        label = { Text("Library") },
                     )
                 }
             },
@@ -113,6 +134,7 @@ fun AppRoot(vm: AppViewModel = viewModel()) {
             Box(Modifier.padding(padding).fillMaxSize()) {
                 when (tab) {
                     Tab.Home -> HomeScreen(vm)
+                    Tab.Search -> SearchScreen(vm, focusSearch) { focusSearch = false }
                     Tab.Library -> LibraryScreen(vm)
                 }
             }
@@ -127,13 +149,69 @@ fun AppRoot(vm: AppViewModel = viewModel()) {
     }
 }
 
-// ---------------------------------------------------------------- Home
+// ---------------------------------------------------------------- Home (recommendations)
 
 @Composable
 private fun HomeScreen(vm: AppViewModel) {
+    LaunchedEffect(Unit) { vm.loadFeed() }
+
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("PureTube", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+            IconButton(onClick = { vm.loadFeed(force = true) }, enabled = !vm.feedLoading) {
+                Icon(Icons.Default.Refresh, "Refresh recommendations")
+            }
+        }
+        if (vm.feedLoading && vm.feed.isNotEmpty()) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+        }
+
+        when {
+            vm.feed.isEmpty() && vm.feedLoading -> Centered { CircularProgressIndicator() }
+            vm.feed.isEmpty() -> Centered {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        vm.feedError ?: "Nothing to show yet.\nWatch or subscribe to get recommendations.",
+                        color = if (vm.feedError != null) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurface,
+                    )
+                    TextButton(onClick = { vm.loadFeed(force = true) }) { Text("Try again") }
+                }
+            }
+            else -> LazyColumn(contentPadding = PaddingValues(bottom = 16.dp)) {
+                items(vm.feed, key = { it.url }) { v -> VideoRow(v) { vm.openVideo(v) } }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Search
+
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun SearchScreen(vm: AppViewModel, focusRequest: Boolean, onFocusHandled: () -> Unit) {
+    val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    var focused by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
-    // Infinite scroll: load more near the end of the list.
+    // Second tap on the Search tab: focus the text field and open the keyboard.
+    LaunchedEffect(focusRequest) {
+        if (focusRequest) {
+            runCatching { focusRequester.requestFocus() }
+            keyboard?.show()
+            onFocusHandled()
+        }
+    }
+
+    // Back closes the suggestions first (the keyboard itself consumes the first back press).
+    BackHandler(enabled = focused) { focusManager.clearFocus() }
+
+    // Infinite scroll for results.
     LaunchedEffect(listState, vm.results.size) {
         snapshotFlow {
             val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
@@ -141,31 +219,94 @@ private fun HomeScreen(vm: AppViewModel) {
         }.collect { nearEnd -> if (nearEnd && vm.results.isNotEmpty()) vm.loadMore() }
     }
 
+    fun submit(text: String) {
+        vm.search(text)
+        focusManager.clearFocus()
+        keyboard?.hide()
+    }
+
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         OutlinedTextField(
             value = vm.query,
-            onValueChange = { vm.query = it },
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            onValueChange = vm::onQueryChange,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+                .focusRequester(focusRequester)
+                .onFocusChanged { focused = it.isFocused },
             singleLine = true,
             placeholder = { Text("Search videos") },
             leadingIcon = { Icon(Icons.Default.Search, null) },
+            trailingIcon = {
+                if (vm.query.isNotEmpty()) {
+                    IconButton(onClick = { vm.onQueryChange("") }) { Icon(Icons.Default.Close, "Clear") }
+                }
+            },
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-            keyboardActions = KeyboardActions(onSearch = { vm.search() }),
+            keyboardActions = KeyboardActions(onSearch = { submit(vm.query) }),
         )
 
-        when {
-            vm.results.isEmpty() && vm.searching -> Centered { CircularProgressIndicator() }
-            vm.results.isEmpty() && vm.searchError != null ->
-                Centered { Text(vm.searchError!!, color = MaterialTheme.colorScheme.error) }
-            vm.results.isEmpty() -> Centered { Text("Search for something to watch.\nNo ads. No Shorts.") }
-            else -> LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
-                items(vm.results, key = { it.url }) { v ->
-                    VideoRow(v) { vm.openVideo(v) }
-                }
-                if (vm.searching) item {
-                    Box(Modifier.fillMaxWidth().padding(16.dp), Alignment.Center) { CircularProgressIndicator() }
+        if (focused) {
+            SuggestionList(vm, onPick = { submit(it) })
+        } else {
+            when {
+                vm.results.isEmpty() && vm.searching -> Centered { CircularProgressIndicator() }
+                vm.results.isEmpty() && vm.searchError != null ->
+                    Centered { Text(vm.searchError!!, color = MaterialTheme.colorScheme.error) }
+                vm.results.isEmpty() && vm.searched -> Centered { Text("No results.") }
+                vm.results.isEmpty() -> Centered { Text("Search for something to watch.\nNo ads. No Shorts.") }
+                else -> LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
+                    items(vm.results, key = { it.url }) { v -> VideoRow(v) { vm.openVideo(v) } }
+                    if (vm.searching) item {
+                        Box(Modifier.fillMaxWidth().padding(16.dp), Alignment.Center) { CircularProgressIndicator() }
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SuggestionList(vm: AppViewModel, onPick: (String) -> Unit) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        if (vm.query.isBlank()) {
+            if (vm.recent.isNotEmpty()) {
+                item(key = "recent-header") {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Recent searches", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { vm.clearRecent() }) { Text("Clear all") }
+                    }
+                }
+            }
+            items(vm.recent, key = { "r:$it" }) { r ->
+                SuggestionRow(text = r, recent = true, onClick = { onPick(r) }, onRemove = { vm.removeRecent(r) })
+            }
+        } else {
+            val typed = vm.query.trim()
+            if (vm.suggestions.none { it.equals(typed, ignoreCase = true) }) {
+                item(key = "typed") { SuggestionRow(text = typed, recent = false, onClick = { onPick(typed) }) }
+            }
+            items(vm.suggestions, key = { "s:$it" }) { s ->
+                SuggestionRow(text = s, recent = false, onClick = { onPick(s) })
+            }
+        }
+    }
+}
+
+@Composable
+private fun SuggestionRow(text: String, recent: Boolean, onClick: () -> Unit, onRemove: (() -> Unit)? = null) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(if (recent) Icons.Default.History else Icons.Default.Search, null)
+        Spacer(Modifier.width(16.dp))
+        Text(text, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        if (onRemove != null) {
+            IconButton(onClick = onRemove, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Close, "Remove") }
         }
     }
 }
@@ -265,7 +406,7 @@ private fun WatchScreen(vm: AppViewModel) {
                 CircularProgressIndicator(Modifier.align(Alignment.Center))
             }
             IconButton(onClick = { vm.closeVideo() }, modifier = Modifier.align(Alignment.TopStart)) {
-                Icon(Icons.Default.ArrowBack, "Back", tint = androidx.compose.ui.graphics.Color.White)
+                Icon(Icons.Default.ArrowBack, "Back", tint = Color.White)
             }
         }
 
@@ -339,14 +480,10 @@ private fun QualityPicker(vm: AppViewModel, options: List<QualityOption>) {
 
 @Composable
 private fun SubscribeButton(vm: AppViewModel, ref: ChannelRef) {
-    val subscribed = vm.isSubscribed(ref)
-    if (subscribed) {
+    if (vm.isSubscribed(ref)) {
         OutlinedButton(onClick = { vm.toggleSubscribe(ref) }) { Text("Subscribed") }
     } else {
-        Button(
-            onClick = { vm.toggleSubscribe(ref) },
-            colors = ButtonDefaults.buttonColors(),
-        ) { Text("Subscribe") }
+        Button(onClick = { vm.toggleSubscribe(ref) }) { Text("Subscribe") }
     }
 }
 
@@ -365,12 +502,12 @@ private fun VideoRow(video: VideoItem, onClick: () -> Unit) {
             if (video.durationSec > 0) {
                 Text(
                     formatDuration(video.durationSec),
-                    color = androidx.compose.ui.graphics.Color.White,
+                    color = Color.White,
                     style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
                         .padding(6.dp)
-                        .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.75f), RoundedCornerShape(4.dp))
+                        .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(4.dp))
                         .padding(horizontal = 4.dp, vertical = 2.dp),
                 )
             }
